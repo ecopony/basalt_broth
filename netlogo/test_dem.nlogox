@@ -1,0 +1,389 @@
+<?xml version="1.0" encoding="utf-8"?>
+<model version="NetLogo 7.0.3" snapToGrid="false">
+  <code>; Bioswale placement model - DEM with D8 flow routing and FIS-based bioswale siting
+extensions [gis]
+
+breed [waters water]
+breed [bioswales bioswale]
+
+globals [
+  elevation-data
+  suitability-data
+  priority-data
+  min-elev
+  max-elev
+  total-captured
+  total-escaped
+  total-infiltrated
+]
+
+patches-own [
+  elevation
+  flow-to
+  flow-accum
+  flow-heading    ; heading toward flow-to (-1 for sinks/nodata)
+  suitability
+  priority
+]
+
+bioswales-own [
+  capacity
+  current-volume
+  infiltration-rate
+  captures
+]
+
+to setup
+  clear-all
+
+  set total-captured 0
+  set total-escaped 0
+  set total-infiltrated 0
+
+  ; Load the DEM
+  set elevation-data gis:load-dataset "/Users/edcopony/src/basalt_broth/data/dem/study_area_dem_utm.asc"
+  set min-elev gis:minimum-of elevation-data
+  set max-elev gis:maximum-of elevation-data
+  gis:set-world-envelope gis:envelope-of elevation-data
+  gis:apply-raster elevation-data elevation
+
+  ; Load FIS layers
+  set suitability-data gis:load-dataset "/Users/edcopony/src/basalt_broth/data/derived/fis_suitability_utm.asc"
+  set priority-data gis:load-dataset "/Users/edcopony/src/basalt_broth/data/derived/fis_priority_utm.asc"
+  gis:apply-raster suitability-data suitability
+  gis:apply-raster priority-data priority
+
+  calculate-flow-direction
+  calculate-flow-headings
+  calculate-flow-accumulation
+  color-by-elevation
+
+  print (word "Elevation range: " precision min-elev 1 " to " precision max-elev 1 " ft")
+  print (word "Patches: " count patches " (" count patches with [elevation &gt;= 0] " valid)")
+  print (word "FIS layers loaded - suitability and priority applied")
+  reset-ticks
+end
+
+to calculate-flow-direction
+  ; D8 algorithm: each patch flows to its steepest downhill neighbor
+  ask patches with [elevation &gt;= 0] [
+    let my-elev elevation
+    let steepest-neighbor nobody
+    let steepest-drop 0
+
+    ask neighbors with [elevation &gt;= 0] [
+      let drop my-elev - elevation
+      let dist distance myself
+      let slope drop / dist
+      if slope &gt; steepest-drop [
+        set steepest-drop slope
+        set steepest-neighbor self
+      ]
+    ]
+
+    set flow-to steepest-neighbor
+  ]
+
+  let flowing count patches with [is-patch? flow-to]
+  let sinks count patches with [elevation &gt;= 0 and not is-patch? flow-to]
+  print (word "Flow direction: " flowing " flowing, " sinks " sinks")
+end
+
+to calculate-flow-headings
+  ; Store the heading toward each patch's flow-to for direction-aware spacing
+  ask patches [
+    ifelse is-patch? flow-to [
+      set flow-heading towards flow-to
+    ] [
+      set flow-heading -1
+    ]
+  ]
+end
+
+to calculate-flow-accumulation
+  ; Count upstream contributing area for each patch
+  ask patches [ set flow-accum 0 ]
+
+  let sorted-patches sort-on [(- elevation)] patches with [elevation &gt;= 0]
+
+  foreach sorted-patches [ p -&gt;
+    ask p [
+      set flow-accum flow-accum + 1
+      if is-patch? flow-to [
+        ask flow-to [
+          set flow-accum flow-accum + [flow-accum] of p
+        ]
+      ]
+    ]
+  ]
+end
+
+; --- Visualization ---
+
+to color-by-elevation
+  ask patches [
+    ifelse elevation &gt;= 0 [
+      set pcolor scale-color brown elevation max-elev min-elev
+    ] [
+      set pcolor blue
+    ]
+  ]
+end
+
+to color-by-flow
+  ; Visualize flow accumulation (log scale for visibility)
+  let max-flow max [flow-accum] of patches
+  ask patches [
+    ifelse elevation &gt;= 0 and flow-accum &gt; 0 [
+      let log-flow ln (flow-accum + 1)
+      let log-max ln (max-flow + 1)
+      set pcolor scale-color blue log-flow log-max 0
+    ] [
+      set pcolor black
+    ]
+  ]
+  print (word "Max flow accumulation: " max-flow " cells")
+end
+
+to color-by-suitability
+  ask patches [
+    ifelse elevation &gt;= 0 and suitability &gt; 0 [
+      set pcolor approximate-hsb (suitability * 120) 200 200
+    ] [
+      set pcolor black
+    ]
+  ]
+end
+
+to color-by-priority
+  ask patches [
+    ifelse elevation &gt;= 0 and priority &gt; 0 [
+      set pcolor approximate-hsb (priority * 120) 200 200
+    ] [
+      set pcolor black
+    ]
+  ]
+end
+
+to show-flow-arrows
+  ; Create turtles to visualize flow direction (preserve waters and bioswales)
+  ask turtles with [breed != waters and breed != bioswales] [ die ]
+  ask patches with [is-patch? flow-to] [
+    if random 100 &lt; 5 [
+      sprout 1 [
+        set color yellow
+        set size 3
+        face [flow-to] of patch-here
+      ]
+    ]
+  ]
+end
+
+; --- Bioswale Placement ---
+
+to place-bioswales
+  ask bioswales [ die ]
+
+  let candidates sort-on [(- priority)] patches with [elevation &gt;= 0 and priority &gt; 0]
+  let placed 0
+
+  let min-gap 3  ; absolute minimum distance (patches) regardless of side
+
+  foreach candidates [ p -&gt;
+    if placed &lt; num-bioswales [
+      ; Direction-aware spacing: full spacing on same side, min-gap across the street
+      let dominated? false
+      if any? bioswales [
+        ask bioswales [
+          if not dominated? [
+            let d distance p
+            if d &lt; min-gap [
+              set dominated? true  ; too close regardless of side
+            ]
+            if not dominated? and d &lt; bioswale-spacing [
+              ; Check if same flow direction (= same side of street)
+              let p-heading [flow-heading] of p
+              let b-heading [flow-heading] of patch-here
+              if p-heading &gt;= 0 and b-heading &gt;= 0 [
+                let angle-diff abs (p-heading - b-heading)
+                if angle-diff &gt; 180 [ set angle-diff 360 - angle-diff ]
+                if angle-diff &lt; 90 [
+                  set dominated? true  ; same side, enforce full spacing
+                ]
+              ]
+            ]
+          ]
+        ]
+      ]
+
+      if not dominated? [
+        ask p [
+          sprout-bioswales 1 [
+            set shape "square"
+            set color green
+            set size 3
+            set capacity 10
+            set current-volume 0
+            set infiltration-rate [suitability] of patch-here * 0.5
+            set captures 0
+          ]
+        ]
+        set placed placed + 1
+      ]
+    ]
+  ]
+
+  print (word "Placed " count bioswales " bioswales (spacing: " bioswale-spacing " patches / ~" (bioswale-spacing * 5) "m)")
+end
+
+to remove-bioswales
+  ask bioswales [ die ]
+  print "All bioswales removed"
+end
+
+; --- Water Agent Simulation ---
+
+to rain
+  ; Spawn water droplets randomly across the landscape
+  ask n-of rain-intensity patches with [elevation &gt;= 0] [
+    sprout-waters 1 [
+      set color cyan
+      set size 2
+      set shape "circle"
+    ]
+  ]
+end
+
+to go
+  ; Move water agents downhill
+  ask waters [
+    let target [flow-to] of patch-here
+    if is-patch? target [
+      move-to target
+    ]
+  ]
+
+  ; Bioswale capture - water on a bioswale patch gets absorbed
+  ask waters [
+    let my-bioswale one-of bioswales-here
+    if my-bioswale != nobody and [current-volume] of my-bioswale &lt; [capacity] of my-bioswale [
+      ask my-bioswale [
+        set current-volume current-volume + 1
+        set captures captures + 1
+      ]
+      set total-captured total-captured + 1
+      die
+    ]
+  ]
+
+  ; Sink escape - water at sinks with no bioswale capture
+  ask waters [
+    if not is-patch? [flow-to] of patch-here [
+      set total-escaped total-escaped + 1
+      die
+    ]
+  ]
+
+  ; Bioswale infiltration - slowly drain stored water
+  ask bioswales [
+    set current-volume max list 0 (current-volume - infiltration-rate)
+  ]
+
+  tick
+end
+
+to clear-water
+  ask waters [ die ]
+end</code>
+  <widgets>
+    <view x="210" wrappingAllowedX="false" y="10" frameRate="30.0" minPycor="0" height="500" showTickCounter="true" patchSize="1.0" fontSize="10" wrappingAllowedY="false" width="700" tickCounterLabel="ticks" maxPycor="304" updateMode="1" maxPxcor="499" minPxcor="0"></view>
+    <button x="20" y="20" height="40" disableUntilTicks="false" forever="false" kind="Observer" width="80" display="Setup">setup</button>
+    <button x="110" y="20" height="40" disableUntilTicks="false" forever="false" kind="Observer" width="100" display="Elevation">color-by-elevation</button>
+    <button x="20" y="70" height="40" disableUntilTicks="false" forever="false" kind="Observer" width="100" display="Flow Accum">color-by-flow</button>
+    <button x="130" y="70" height="40" disableUntilTicks="false" forever="false" kind="Observer" width="80" display="Flow Arrows">show-flow-arrows</button>
+    <button x="20" y="120" height="40" disableUntilTicks="false" forever="false" kind="Observer" width="95" display="Suitability">color-by-suitability</button>
+    <button x="125" y="120" height="40" disableUntilTicks="false" forever="false" kind="Observer" width="85" display="Priority">color-by-priority</button>
+    <button x="20" y="170" height="40" disableUntilTicks="false" forever="false" kind="Observer" width="80" display="Rain">rain</button>
+    <button x="110" y="170" height="40" disableUntilTicks="false" forever="true" kind="Observer" width="80" display="Go">go</button>
+    <button x="20" y="220" height="40" disableUntilTicks="false" forever="false" kind="Observer" width="100" display="Clear Water">clear-water</button>
+    <button x="20" y="270" height="40" disableUntilTicks="false" forever="false" kind="Observer" width="115" display="Place Bioswales">place-bioswales</button>
+    <button x="145" y="270" height="40" disableUntilTicks="false" forever="false" kind="Observer" width="65" display="Remove">remove-bioswales</button>
+    <slider x="20" y="320" height="50" direction="Horizontal" display="rain-intensity" variable="rain-intensity" min="10.0" max="500.0" default="100.0" step="10.0" width="180"></slider>
+    <slider x="20" y="380" height="50" direction="Horizontal" display="num-bioswales" variable="num-bioswales" min="10.0" max="500.0" default="50.0" step="10.0" width="180"></slider>
+    <slider x="20" y="440" height="50" direction="Horizontal" display="bioswale-spacing" variable="bioswale-spacing" min="2.0" max="30.0" default="10.0" step="1.0" width="180"></slider>
+    <output x="20" y="500" height="80" fontSize="11" width="180"></output>
+    <monitor x="210" y="520" width="100" height="45" display="Captured" precision="0" fontSize="11">total-captured</monitor>
+    <monitor x="315" y="520" width="100" height="45" display="Escaped" precision="0" fontSize="11">total-escaped</monitor>
+    <monitor x="420" y="520" width="130" height="45" display="Capture %" precision="1" fontSize="11">ifelse-value (total-captured + total-escaped &gt; 0) [100 * total-captured / (total-captured + total-escaped)] [0]</monitor>
+    <monitor x="555" y="520" width="100" height="45" display="Bioswales" precision="0" fontSize="11">count bioswales</monitor>
+    <monitor x="660" y="520" width="100" height="45" display="Water" precision="0" fontSize="11">count waters</monitor>
+    <plot x="210" y="575" width="400" height="180" display="Capture Rate" xAxis="ticks" yAxis="% captured" xMin="0.0" xMax="100.0" yMin="0.0" yMax="100.0" autoPlotX="true" autoPlotY="true" legend="true">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="capture %" color="-10899396" legend="true">
+        <setup></setup>
+        <update>if total-captured + total-escaped &gt; 0 [plot 100 * total-captured / (total-captured + total-escaped)]</update>
+      </pen>
+    </plot>
+  </widgets>
+  <info><![CDATA[## Bioswale Placement Model
+
+### Overview
+Agent-based model simulating stormwater runoff across Portland's real terrain. Uses GIS data (DEM, soil, impervious surfaces) to route water downhill, then evaluates where bioswales would capture the most runoff using a two-stage Fuzzy Inference System (FIS).
+
+### Setup
+**Setup** loads three GIS layers:
+- **DEM** — elevation for D8 flow routing
+- **Suitability** — FIS Stage 1: physical infiltration potential (slope + soil + groundwater)
+- **Priority** — FIS Stage 2: capture potential (suitability + impervious area + topographic wetness)
+
+### Visualization Modes
+- **Elevation** — Brown shading (high = light, low = dark). Blue = nodata
+- **Flow Accum** — Blue shading (bright = high upstream area = drainage channels)
+- **Suitability** — Green = high infiltration potential, Red = low
+- **Priority** — Green = best bioswale candidate locations, Red = worst
+- **Flow Arrows** — Yellow arrows showing D8 flow direction (5% sample)
+
+### Bioswale Placement
+- **Place Bioswales** — Places `num-bioswales` bioswales on the highest-priority patches
+- **Remove** — Removes all bioswales
+- **num-bioswales** slider controls how many to place (10–500)
+
+Bioswale properties:
+- **Capacity**: 10 units of water storage
+- **Infiltration rate**: proportional to suitability (higher suitability = faster drainage)
+- Bioswales slowly drain between rain events, providing renewable capture capacity
+
+### Water Simulation
+- **Rain** — Spawns `rain-intensity` water droplets randomly on valid terrain
+- **Go** — Runs simulation: water flows downhill via D8 routing
+- Water agents (cyan circles) can be **captured** by bioswales or **escape** to storm drains at sinks
+- **Clear Water** — Removes all water agents
+
+### Metrics
+- **Captured** — Total water agents absorbed by bioswales
+- **Escaped** — Total water agents that reached sinks (storm drains)
+- **Capture %** — Percentage of resolved water captured by bioswales
+- **Bioswales** — Current number of bioswale agents
+- **Water** — Current number of active water agents
+- **Capture Rate** plot — Tracks capture percentage over time
+
+### How to Experiment
+1. Click **Setup** to load terrain and FIS data
+2. Click **Priority** to visualize where the FIS recommends bioswales
+3. Set `num-bioswales` and click **Place Bioswales**
+4. Click **Rain** several times, then click **Go** to watch water flow
+5. Watch the **Capture %** monitor and plot
+6. Try different `num-bioswales` values to see diminishing returns
+7. Compare: 10 bioswales vs. 200 vs. 500
+
+### D8 Flow Routing
+Each patch drains to its steepest downhill neighbor (8 directions). Flow accumulation counts how many upstream patches drain through each cell. High accumulation = natural drainage channels.
+
+### FIS Methodology
+Adapted from the Beaver Restoration Assessment Tool (BRAT):
+- **Stage 1** (Suitability): Combines slope, soil permeability, and groundwater depth → physical infiltration potential
+- **Stage 2** (Priority): Combines suitability with impervious cover and topographic wetness index → capture priority
+- Uses Mamdani inference with trapezoidal membership functions and centroid defuzzification
+]]></info>
+</model>
